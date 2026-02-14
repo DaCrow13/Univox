@@ -1,0 +1,583 @@
+import tempfile
+import os
+import base64
+import uuid
+import requests
+import time
+import re
+from typing import Union, List, Optional, Dict, Any
+from abc import ABC, abstractmethod
+
+from study_buddy.utils.logging_config import get_logger, LogContext, metrics
+
+logger = get_logger("nodes")
+
+from study_buddy.utils.llm import llm
+from study_buddy.utils.logging_utils import log_llm_interaction, log_tool_call, log_state_change
+from study_buddy.utils.tools import get_all_tools
+from langgraph.prebuilt import ToolNode
+from study_buddy.config import CONFIG
+
+# =============================================================================
+# Constants & System Prompts
+# =============================================================================
+
+system_prompt = """
+- When ANY tool returns data, YOU MUST USE THAT DATA in your response
+- NEVER ignore tool results or give generic "how can I help" responses
+- If a tool executed successfully, incorporate its output into your answer
+- DO NOT ask "how can I assist you" when you've already received tool results
+
+### CRITICAL: FAITHFULNESS & HALLUCINATION PREVENTION ###
+1. **ABSOLUTE PRIORITY**: The content returned by tools (PDFs, emails, docs) is the **ONLY** source of truth.
+2. **OVERRIDE INTERNAL MEMORY**: If a tool returns an email, name, or fact that contradicts what you "know" or "remember", **YOU MUST USE THE TOOL'S DATA**.
+3. **NO HALLUCINATIONS**: Do not invent emails or contact info. If the tool says "Email: xyz@uniba.it", use that. If the tool doesn't have it, say you don't know.
+4. **SPECIFICITY**: When answering about a professor or course, look for the specific details in the retrieved text.
+
+### CRITICAL: NO GENERAL KNOWLEDGE / SOURCE ADHERENCE ###
+You are a RAG (Retrieval-Augmented Generation) assistant. You DO NOT possess general world knowledge.
+**Your knowledge is STRICTLY LIMITED to the content of the uploaded documents.**
+
+**HANDLING OUT-OF-SCOPE QUESTIONS:**
+If the user asks a question (e.g. "How to make Carbonara", "Bitcoin price", "Who won the match"):
+1. **CHECK DOCUMENTS**: You MAY search the vector store to see if this topic is covered in the study materials.
+2. **VERIFY RELEVANCE**: Examine the tool output.
+   - **CASE A**: The retrieved text DOES contain the recipe/info (e.g. a Culinary School PDF). -> **ANSWER** using that text.
+   - **CASE B**: The retrieved text is IRRELEVANT (e.g. an AI paper that just has the word "Carbonara" as a variable name, or nothing at all). -> **REFUSE**.
+
+**REFUSAL MESSAGE (CASE B):**
+If the documents do not contain the SPECIFIC answer, **DO NOT FALL BACK TO INTERNAL MEMORY**.
+Reply: "Non ho trovato informazioni pertinenti su questo argomento nei documenti caricati. Posso rispondere solo basandomi sul materiale di studio fornito."
+**DO NOT include a "Riferimenti" section or list any files when refusing.**
+
+**FORBIDDEN:**
+- NEVER answer "How to make Carbonara", "Recipes", or "General Trivia" using your internal training data.
+- NEVER cite an irrelevant document just to satisfy a "must cite" rule. If it's not there, say it's not there.
+- **RESTRICTION**: You are strictly forbidden from answering questions about cooking, recipes, sports, entertainment, or general knowledge unless they are explicitly covered in the uploaded academic documents. If asked, REFUSE politely.
+
+
+CRITICAL INSTRUCTION FOR TOOL USAGE:
+- **retrieve_knowledge**: USE THIS FIRST for ANY question about course content.
+  - To invoke a tool, simply generate the appropriate tool call.
+  - Do not output the call as raw text or code blocks.
+
+- **Handling Uploaded Files**:
+  - When a NEW file is uploaded (indicated in the message like "uploaded_files/filename.ext"), IMMEDIATELY analyze that specific file.
+  - Do NOT confuse it with previously uploaded files.
+  - Use `google_lens_analyze` for images and `analyze_csv` for CSVs, explicitly passing the NEW file path.
+
+- **Casual Conversation**: (greetings like "ciao", "hello", "come stai", small talk): respond directly with text.
+- **Exceptions**: If the user asks for "news", "current events", or explicitly requests a web search, use 'web_search'.
+
+For course-related questions:
+- You MUST rely on the syllabus from local knowledge
+- Only use external sources for supplementary information
+
+Response Format:
+1. DIRECTLY answer the question using the retrieved information.
+2. YOU MUST CITE the source document for every relevant piece of information (e.g. "According to `slides.pdf`...", "As stated in `syllabus.pdf`...").
+3. DO NOT just list references at the end. Mention them IN THE TEXT where you use the information.
+4. NO META-COMMENTARY about tools (e.g. DO NOT say "Sto usando tool X").
+5. Include a "Riferimenti:" section at the end with the full list of files used.
+
+Use LaTeX notation for mathematical formulas: inline with $formula$ and display with $$formula$$.
+If no reliable sources are found, clearly state limitations rather than guessing.
+        
+CRITICAL INSTRUCTIONS FOR TOOL USAGE:
+1. When you use a tool and receive output, you MUST incorporate that output into your response to the user
+2. NEVER ignore tool results - if a tool returns information, use it to answer the user's question
+3. Do not say "I couldn't find information" if a tool has successfully returned data
+4. Present tool results clearly and completely to the user
+5. If a tool fails, explain the failure and suggest alternatives
+6. If google_scholar_search returns URLs, include them directly next to the corresponding text or result (not in a separate list)
+7. **CRITICAL: NEVER call the same tool multiple times with the same arguments** - if a tool returns a result (even if empty or error), use that result to formulate your answer. DO NOT retry the tool with different filenames or arguments unless the user explicitly asks.
+8. **For CSV analysis**: If analyze_csv returns an empty dataframe or malformed data, explain this to the user in natural language - DO NOT retry with different filenames.
+9. **For errors**: If a tool returns an error message (e.g., "File not found"), explain the error to the user - DO NOT retry the same tool call.
+10. **CRITICAL - File paths**: When the context mentions "User has uploaded a file: uploaded_files/filename.ext", you MUST use EXACTLY that path. NEVER change the filename to generic names like "data.csv", "file.csv", etc. Always use the exact filename provided in the context.
+
+GOOGLE LENS ANALYSIS - CRITICAL:
+- When google_lens_analyze returns results starting with "🔍 GOOGLE LENS ANALYSIS - IMAGE SUCCESSFULLY ANALYZED", THIS MEANS THE IMAGE WAS ANALYZED SUCCESSFULLY
+- The results will contain "DETECTED VISUAL CONTENT:" showing what objects/subjects were found
+- ALWAYS describe what was found in the image based on the "DETECTED VISUAL CONTENT" and "DETAILED SEARCH RESULTS"
+- NEVER say "I couldn't find information" or "the image was not provided" when google_lens_analyze returns data
+- Example response: "L'immagine contiene [describe the DETECTED VISUAL CONTENT]. Google Lens ha trovato [summarize key findings from DETAILED SEARCH RESULTS]"
+- Be specific and direct - tell the user what's in the image based on the tool results
+
+WORKFLOW:
+1. CHECK if query is OUT-OF-TOPIC. If yes -> REFUSE.
+2. Analyze the user's request
+3. Use appropriate tools to gather information
+"""
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def _serialize_message(msg):
+    """Helper to serialize messages for the LLM, preserving tool_call_ids."""
+    if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+        result = {'role': str(msg.get('role', 'user')), 'content': str(msg.get('content', ''))}
+        if 'tool_call_id' in msg:
+            result['tool_call_id'] = msg['tool_call_id']
+        return result
+
+    role = None
+    content = None
+    tool_call_id = None
+
+    if hasattr(msg, 'type'):
+        t = getattr(msg, 'type')
+        if t == 'human':
+            role = 'user'
+        elif t == 'ai':
+            role = 'assistant'
+        elif t == 'system':
+            role = 'system'
+        elif t == 'tool':
+            role = 'tool'
+            if hasattr(msg, 'tool_call_id'):
+                tool_call_id = getattr(msg, 'tool_call_id')
+        else:
+            role = str(t)
+
+    if not role and hasattr(msg, 'role'):
+        role = str(getattr(msg, 'role'))
+
+    if hasattr(msg, 'content'):
+        content = getattr(msg, 'content')
+    else:
+        try:
+            content = msg.get('content', None) if isinstance(msg, dict) else None
+        except Exception:
+            content = None
+
+    if content is None:
+        try:
+            content = str(msg)
+        except Exception:
+            content = ''
+
+    if not role:
+        role = 'user'
+
+    result = {'role': role, 'content': str(content)}
+    if tool_call_id:
+        result['tool_call_id'] = tool_call_id
+    return result
+
+
+def _extract_lens_info_fallback(tool_content: str) -> str:
+    """Fallback manuale (Regex) se l'LLM fallisce."""
+    detected = None
+    detected_match = re.search(r'DETECTED VISUAL CONTENT:?\s*(.*)', tool_content)
+    if detected_match:
+        detected = detected_match.group(1).strip()
+    
+    if not detected:
+        detailed_match = re.search(r'DETAILED SEARCH RESULTS:?\s*(.*)', tool_content, re.DOTALL)
+        if detailed_match:
+            detailed_text = detailed_match.group(1).strip()
+            title_match = re.search(r'Title:\s*([^\n]+)', detailed_text)
+            if title_match:
+                title_clean = title_match.group(1).strip()
+                title_clean = re.sub(r'\s*\|.*$', '', title_clean).strip()
+                detected = title_clean
+    
+    if detected:
+        return f"L'immagine mostra: {detected}."
+    
+    return "Ho analizzato l'immagine. Ecco i dettagli grezzi:\n" + tool_content[:300]
+
+
+def _synthesize_answer(model, raw_data: str, user_query: str) -> str:
+    """
+    Helper function to force the LLM to synthesize raw data into a DIRECT answer.
+    Includes the user query to ensure the answer is relevant and not a summary of everything.
+    """
+    force_answer_prompt = (
+        f"DOMANDA UTENTE: \"{user_query}\"\n\n"
+        "Ho trovato i seguenti DATI GREZZI nel database.\n"
+        "Il tuo compito è rispondere alla domanda dell'utente usando SOLO questi dati.\n\n"
+        f"--- INIZIO DATI GREZZI ---\n{raw_data[:7000]}\n--- FINE DATI GREZZI ---\n\n"
+        "ISTRUZIONI CRITICHE:\n"
+        "1. Rispondi SOLO alla domanda specifica dell'utente. Sii CONCISO e DIRETTO.\n"
+        "2. NON riassumere l'intero documento se non richiesto.\n"
+        "3. Se l'utente chiede un dato specifico (es. email, data, nome), fornisci quel dato e basta.\n"
+        "4. Ignora le informazioni nel testo che non c'entrano con la domanda.\n"
+        "5. Rispondi in italiano naturale.\n"
+    )
+    
+    try:
+        synthesis = model.invoke([
+            {"role": "system", "content": "Sei un assistente preciso. Rispondi esattamente alla domanda basandoti sui dati forniti, senza divagare."},
+            {"role": "user", "content": force_answer_prompt}
+        ])
+        return synthesis.content
+    except Exception as e:
+        logger.error(f"Synthesis failed: {e}")
+        return f"Ecco le informazioni trovate:\n{raw_data[:800]}..."
+
+# =============================================================================
+# Node Functions
+# =============================================================================
+
+@log_llm_interaction
+def call_model(state, config):
+    """
+    Main function to handle model calls with detailed logging.
+    """
+    logger.info("🤖 Starting new model interaction")
+    messages = state["messages"]
+    
+    # ------------------------------------------------------------------
+    # 1. Prepare Messages & History Pruning
+    # ------------------------------------------------------------------
+    
+    # Extract last user message for context
+    user_message = "Richiesta dell'utente" # Default fallback
+    for msg in reversed(messages):
+        if (isinstance(msg, dict) and msg.get('role') == 'user') or \
+           (hasattr(msg, 'role') and getattr(msg, 'role', None) == 'user') or \
+           (hasattr(msg, 'type') and getattr(msg, 'type', None) == 'human'):
+            content = msg.get('content') if isinstance(msg, dict) else getattr(msg, 'content', None)
+            if content:
+                user_message = content
+            break
+
+    # Anti-loop tracking setup
+    tool_call_counts_pre = {}
+    is_loop_detected = False
+    looping_tool_name = None
+
+    for msg in messages[-12:]:
+        tool_calls_list = None
+        if isinstance(msg, dict) and 'tool_calls' in msg:
+            tool_calls_list = msg.get('tool_calls', [])
+        elif hasattr(msg, 'tool_calls'):
+            tool_calls_list = getattr(msg, 'tool_calls', None)
+        
+        if tool_calls_list:
+            for tc in tool_calls_list:
+                if isinstance(tc, dict):
+                    tool_name = tc.get('name', 'unknown')
+                    tool_args = str(tc.get('args', {}))
+                else:
+                    tool_name = getattr(tc, 'name', 'unknown')
+                    tool_args = str(getattr(tc, 'args', {}))
+                key = f"{tool_name}|{tool_args}"
+                tool_call_counts_pre[key] = tool_call_counts_pre.get(key, 0) + 1
+
+    # Serialize messages for LLM
+    system_message_content = system_prompt
+
+    # --- DYNAMIC SYSTEM PROMPT INJECTION (COMPLEXITY) ---
+    complexity = config.get("configurable", {}).get("complexity_level", "None")
+    logger.info(f"🔍 [DEBUG] Selected Complexity Level: '{complexity}'")
+    
+    if complexity == "Base":
+        system_message_content += (
+            "\n\n[COMPLEXITY: BASE - FOR ABSOLUTE BEGINNERS]\n"
+            "- TARGET AUDIENCE: A 5-year-old or someone completely new to the topic.\n"
+            "- LENGTH CONSTRAINT: Keep the answer SHORT (max 100-150 words).\n"
+            "- VOCABULARY: Use extremely simple, non-technical language. NO JARGON.\n"
+            "- STYLE: Use analogies from real life (e.g., 'imagine a library' instead of 'database').\n"
+            "- FORMAT: Simple paragraphs. No complex lists or formulas unless absolutely necessary."
+        )
+    elif complexity == "Intermediate":
+        system_message_content += (
+            "\n\n[COMPLEXITY: INTERMEDIATE - UNIVERSITY STUDENT]\n"
+            "- TARGET AUDIENCE: A university student studying for an exam.\n"
+            "- LENGTH CONSTRAINT: Medium length (200-300 words). Balanced detail.\n"
+            "- VOCABULARY: Use proper academic terminology, but define complex terms briefly if they are crucial.\n"
+            "- STYLE: Educational and clear. Focus on 'how' and 'why'.\n"
+            "- FORMAT: Use bullet points for lists and clear structure."
+        )
+    elif complexity == "Advanced":
+        system_message_content += (
+            "\n\n[COMPLEXITY: ADVANCED - POSTGRADUATE RESEARCHER/EXPERT]\n"
+            "- TARGET AUDIENCE: A PhD student, researcher, or industry expert.\n"
+            "- LENGTH CONSTRAINT: Long and detailed (400+ words if needed). Comprehensive.\n"
+            "- VOCABULARY: Use highly technical, precise, and formal language. Assume deep prior knowledge.\n"
+            "- STYLE: Rigorous and theoretical. Discuss implications, limitations, and state-of-the-art context.\n"
+            "- FORMAT: Structured, dense, and potentially including formulas or code snippets."
+        )
+    else: # None / Standard
+        system_message_content += (
+            "\n\n[COMPLEXITY: STANDARD - BALANCED]\n"
+            "- TARGET AUDIENCE: General educated audience.\n"
+            "- LENGTH CONSTRAINT: Balanced (approx. 200 words). Concise but informative.\n"
+            "- VOCABULARY: Professional and clear. Avoid overly simplistic or excessively obscure jargon.\n"
+            "- STYLE: Direct and helpful.\n"
+            "- FORMAT: Natural conversation style."
+        )
+        
+    system_message = {"role": "system", "content": system_message_content}
+    serialized_messages = [_serialize_message(m) for m in messages]
+    
+    # --- HISTORY PRUNING (CONTEXT PROTECTION) ---
+    # Keep System Prompt + Last N messages to avoid >130k context error
+    MAX_HISTORY = 10
+    if len(serialized_messages) > MAX_HISTORY:
+        # Always keep the very last message (user query) and the surrounding context
+        # But we must ensure specific logic:
+        # If we just cut, we might lose the "System" instruction which is separately added below via `full_messages`.
+        # So we just slice the history list.
+        # We try to preserve the last tool output if it exists to avoid "loss of memory" mid-processing
+        pruned_history = serialized_messages[-MAX_HISTORY:]
+        logger.info(f"✂️ Pruned history from {len(serialized_messages)} to {len(pruned_history)} messages.")
+        serialized_messages = pruned_history
+
+    full_messages = [system_message] + serialized_messages
+
+    # --- REINFORCEMENT INJECTION ---
+    # Append a final system reminder to ensure complexity instruction isn't lost in context
+    if complexity in ["Base", "Intermediate", "Advanced", "None"]:
+        reminder = ""
+        if complexity == "Base":
+            reminder = "REMINDER: You are speaking to a BEGINNER (5 years old). Use analogies, NO jargon, simple words. Keep it SHORT (max 150 words)."
+        elif complexity == "Intermediate":
+            reminder = "REMINDER: You are speaking to a STUDENT. Use academic terms but explain them. Be balanced."
+        elif complexity == "Advanced":
+            reminder = "REMINDER: You are speaking to an EXPERT. Use technical language, skip basics, focus on nuance. Be DETAILED."
+        else:
+            reminder = "REMINDER: Keep the response BALANCED and professional. Not too short, not too long."
+            
+        full_messages.append({"role": "system", "content": reminder})
+        logger.info(f"💉 Injected complexity reminder: {reminder}")
+    
+    # Bind tools
+    tools = get_all_tools()
+    model = llm.bind_tools(tools)
+
+    # ------------------------------------------------------------------
+    # 2. Invoke Model
+    # ------------------------------------------------------------------
+    
+    logger.info("🔄 Invoking LLM")
+    try:
+        response = model.invoke(full_messages)
+        
+        # MANUAL PARSER FIX FOR LLAMA 3 RAW OUTPUTS
+        # The model sometimes outputs <|python_tag|>tool_name(args) instead of structured tool_calls
+        content = response.content if hasattr(response, 'content') else ""
+        if isinstance(content, str) and '<|python_tag|>' in content:
+            logger.warning(f"⚠️ Detected raw python tag in response: {content}")
+            
+            # Regex to extract tool name and args
+            # Matches: <|python_tag|>tool_name("arg") or tool_name(arg="val")
+            match = re.search(r'<\|python_tag\|>([\w_]+)\((.*)\)', content, re.DOTALL)
+            if match:
+                tool_name = match.group(1)
+                args_str = match.group(2)
+                
+                # Clean up args string
+                args = {}
+                
+                # Simple heuristic for single string arg (common case)
+                single_arg_match = re.search(r'^["\'](.+)["\']$', args_str.strip())
+                if single_arg_match:
+                    # If it's just a string, try to map it to the first arg of the tool via inspection if needed
+                    # Or just assume "query" or "file_path" based on tool name
+                    val = single_arg_match.group(1)
+                    if 'lens' in tool_name or 'csv' in tool_name or 'extract' in tool_name:
+                        args = {'file_path': val}
+                    elif 'search' in tool_name or 'retrieve' in tool_name:
+                        args = {'query': val}
+                    else:
+                        args = {'input': val} # Generic fallback
+                
+                # Handle key=value case
+                elif '=' in args_str:
+                    try:
+                        # Very simple parsing for arg="value"
+                        # This isn't a full python parser but covers basic cases
+                        pairs = args_str.split(',')
+                        for pair in pairs:
+                            if '=' in pair:
+                                k, v = pair.split('=', 1)
+                                v = v.strip().strip('"').strip("'")
+                                args[k.strip()] = v
+                    except:
+                        pass
+                
+                # Inject constructed tool call
+                logger.info(f"🔧 Manually parsed tool call: {tool_name} with args {args}")
+                response.tool_calls = [{
+                    'name': tool_name,
+                    'args': args,
+                    'id': f"call_{uuid.uuid4()}",
+                    'type': 'tool_call'
+                }]
+                response.content = "" # Clear content so it doesn't look like text
+                
+    except Exception as e:
+        logger.error(f"❌ MODEL INVOKE FAILED: {e}")
+        raise
+    
+    # ------------------------------------------------------------------
+    # 3. Loop Detection Logic
+    # ------------------------------------------------------------------
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        for tc in response.tool_calls:
+            if isinstance(tc, dict):
+                tool_name = tc.get('name', 'unknown')
+                tool_args = str(tc.get('args', {}))
+            else:
+                tool_name = getattr(tc, 'name', 'unknown')
+                tool_args = str(getattr(tc, 'args', {}))
+            
+            key = f"{tool_name}|{tool_args}"
+            if tool_call_counts_pre.get(key, 0) >= 1: # Strict check
+                logger.warning(f"⚠️ LOOP DETECTED: Tool '{tool_name}' called repeatedly.")
+                is_loop_detected = True
+                looping_tool_name = tool_name
+                break
+
+    if is_loop_detected:
+        logger.warning(f"🛑 Preventing loop: removing tool_calls from response")
+        response.tool_calls = []
+        
+        # Find the most recent tool result content from history
+        tool_result_content = None
+        for msg in reversed(serialized_messages):
+            if isinstance(msg, dict) and msg.get('role') == 'tool':
+                tool_result_content = msg.get('content', '')
+                break
+        
+        if tool_result_content:
+            logger.info("🔄 Loop detected with data: Forcing synthesis from existing tool results")
+
+            # Special cases
+            if looping_tool_name == 'summarize_document' or 'Riassunto di:' in tool_result_content:
+                response.content = tool_result_content
+                return {"messages": [response]}
+            
+            # Universal forced synthesis (Calls LLM again to fix raw data)
+            # PASSING USER MESSAGE TO ENSURE RELEVANCE
+            response.content = _synthesize_answer(llm, tool_result_content, user_message)
+        else:
+            response.content = "Ho interrotto l'operazione perché stavo ripetendo la stessa azione senza trovare nuovi dati."
+
+        return {"messages": [response]}
+
+    # ------------------------------------------------------------------
+    # 4. Empty/Generic Response Fix (Hallucination & Lazy Model Check)
+    # ------------------------------------------------------------------
+    
+    # CRITICAL FIX: Check if the LAST message was a tool output.
+    # We only want to fix generic responses if they are reacting to FRESH tool data.
+    # If the last message was from the user (e.g. "Ciao"), a generic response is fine/expected.
+    
+    last_msg = serialized_messages[-1] if serialized_messages else {}
+    last_msg_role = last_msg.get('role') if isinstance(last_msg, dict) else getattr(last_msg, 'role', None)
+    
+    # Only trigger fix if we are in a "Tool Context" (last message was a tool output)
+    is_fresh_tool_context = (last_msg_role == 'tool')
+
+    has_new_tool_calls = hasattr(response, 'tool_calls') and response.tool_calls
+    
+    if is_fresh_tool_context and not has_new_tool_calls and not is_loop_detected:
+        content_is_empty = not hasattr(response, 'content') or not response.content or not str(response.content).strip()
+        
+        # Check for generic responses
+        resp_text = str(response.content).lower() if hasattr(response, 'content') and response.content else ""
+        is_generic = any(x in resp_text for x in ["how can i help", "posso aiutarti", "non ho ricevuto"])
+        
+        # Check if conversational (Redundant if is_fresh_tool_context is checked, but keeping for safety)
+        is_conversational = False
+        if len(user_message.split()) < 10:
+            is_conversational = any(x in user_message.lower() for x in ['ciao', 'hello', 'grazie'])
+
+        if (content_is_empty or is_generic) and not is_conversational:
+            logger.warning("⚠️ Model returned generic/empty response despite tool results. Forcing fix.")
+            
+            # Get last tool output (which we know exists and is fresh)
+            last_tool_content = ""
+            for msg in reversed(serialized_messages):
+                if isinstance(msg, dict) and msg.get('role') == 'tool':
+                    last_tool_content = msg.get('content', '')
+                    break
+            
+            if last_tool_content:
+                # Fix for Google Lens
+                if 'GOOGLE LENS ANALYSIS' in last_tool_content:
+                    interpretation_prompt = (
+                        "Ho trovato dei risultati di analisi visiva ma non li ho descritti bene prima.\n"
+                        "Analizza questi dati e dimmi in ITALIANO cosa c'è nell'immagine.\n"
+                        f"DATI:\n{last_tool_content[:2500]}"
+                    )
+                    try:
+                        interpretation = llm.invoke([{"role": "user", "content": interpretation_prompt}])
+                        response.content = interpretation.content
+                    except:
+                        response.content = _extract_lens_info_fallback(last_tool_content)
+                
+                # Fix for Retrieve Knowledge / General Data
+                else:
+                    logger.info("🔄 Generic response fix: Synthesizing raw tool data")
+                    # PASSING USER MESSAGE TO ENSURE RELEVANCE
+                    response.content = _synthesize_answer(llm, last_tool_content, user_message)
+
+    logger.success("✅ Model interaction completed")
+    return {"messages": [response]}
+
+
+def execute_tool(tool_input: Dict):
+    """
+    Enhanced tool execution with comprehensive logging.
+    """
+    tool_name = tool_input.get('name', 'unknown')
+    arguments = tool_input.get('arguments', {})
+    
+    # Sanitize arguments
+    if isinstance(arguments, dict):
+        for key, value in list(arguments.items()):
+            if isinstance(value, str):
+                arguments[key] = value.replace('\\ ', ' ').replace('\\\\', '/').replace('\\', '/')
+
+    with LogContext(f"tool_execution_{tool_name}", logger):
+        logger.info(f"🔧 Executing {tool_name}")
+        if arguments:
+            logger.info(f"   Args: {str(arguments)[:500]}") # Log arguments, truncated for sanity
+        metrics.increment('tool_calls')
+        
+        tools = get_all_tools()
+        tool = next((t for t in tools if t.name == tool_name), None)
+        
+        if not tool:
+            raise ValueError(f"Tool not found: {tool_name}")
+        
+        try:
+            # Try kwargs first, then single arg fallback
+            try:
+                result = tool.run(**arguments)
+            except (TypeError, AttributeError):
+                if isinstance(arguments, dict) and arguments:
+                    first_arg = next(iter(arguments.values()))
+                    result = tool.run(first_arg)
+                else:
+                    raise
+
+            result_str = str(result)
+            
+            # Truncate huge outputs (except for extraction which needs full text)
+            MAX_CHARS = 20000 
+            if len(result_str) > MAX_CHARS and tool_name != 'extract_text':
+                result = result_str[:MAX_CHARS] + f"\n... [Truncated {tool_name} output]"
+            
+            logger.success(f"✅ {tool_name} completed. Output len: {len(str(result))}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Tool failed: {e}")
+            raise e
+
+@log_state_change
+def process_state(state):
+    """Enhanced state processing logging."""
+    logger.info("🔄 Processing agent state")
+    return state
+
+# Initialize tool node
+# Initialize tool node
+tool_node = ToolNode(get_all_tools())

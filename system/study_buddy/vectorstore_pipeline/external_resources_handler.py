@@ -1,0 +1,70 @@
+import requests
+from youtube_transcript_api import YouTubeTranscriptApi
+from bs4 import BeautifulSoup
+from langchain_core.documents import Document
+from study_buddy.config import logger
+
+
+def extract_text_from_url(url):
+    """Downloads and returns text from a web page."""
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        return soup.get_text()
+    except Exception as e:
+        logger.error(f"Error in text extraction from {url}: {e}")
+        return None
+
+
+def extract_readme_from_repo(repo_url):
+    """Extract the README.md from a GitHub repository."""
+    try:
+        if repo_url.endswith(".git"):
+            repo_url = repo_url[:-4]
+        readme_url = f"{repo_url}/raw/main/README.md"
+        response = requests.get(readme_url, timeout=10)
+        response.raise_for_status()
+        return response.text
+    except Exception as e:
+        logger.error(f"Error retrieving README from {repo_url}: {e}")
+        return None
+
+
+def extract_transcript_from_youtube(youtube_url):
+    """Get an automatic transcript of a YouTube video."""
+    try:
+        video_id = youtube_url.split("v=")[-1].split("&")[0]
+        api = YouTubeTranscriptApi()
+        transcript = api.fetch(video_id)
+        return " ".join([entry['text'] for entry in transcript])
+    except Exception as e:
+        logger.error(f"Error in video transcription {youtube_url}: {e}")
+        return None
+
+
+def extract_external_resources(lesson_data):
+    """Extracts and returns structured documents from the external resources of a lesson."""
+    resources = lesson_data.get("resources", [])
+    extracted_docs = []
+
+    for resource in resources:
+        url = resource.get("url")
+        title = resource.get("title", "External resource")  # Nome predefinito se non specificato
+        content = None
+
+        if "github.com" in url:
+            content = extract_readme_from_repo(url)
+        elif "youtube.com" in url or "youtu.be" in url:
+            content = extract_transcript_from_youtube(url)
+        else:
+            content = extract_text_from_url(url)
+
+        if content:
+            document = Document(
+                page_content=content,
+                metadata={"source": url, "title": title}
+            )
+            extracted_docs.append(document)
+
+    return extracted_docs

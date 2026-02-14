@@ -1,0 +1,16 @@
+timestamp,session_id,age,gender,enrollment,sus_q1,sus_q2,sus_q3,sus_q4,sus_q5,sus_q6,sus_q7,sus_q8,sus_q9,sus_q10,qual_completeness,qual_clarity,qual_utility,qual_trust,qual_sources,nps_score,comments
+2026-02-03T09:15:41.094570,0f085258-9ea3-42bb-9156-74376bd18fb2,22,Uomo,Triennale,4,1,5,1,4,1,4,1,5,1,5,4,4,4,5,9,
+2026-02-03T09:33:54.074605,62a922b9-1a76-4d33-8ed9-eb71188b21eb,21,Uomo,Triennale,5,1,5,1,5,1,5,1,5,1,5,5,5,5,5,10,
+2026-02-03T09:34:37.822545,b910cff8-8fa1-423c-a4a7-ea1d8564af89,21,Uomo,Triennale,5,1,5,1,4,1,4,1,5,1,5,5,5,4,4,9,
+2026-02-03T09:34:42.675432,be264d39-fe7b-435e-a695-a172ce0cfcf0,21,Uomo,Triennale,5,1,4,1,5,1,4,1,5,1,5,5,5,3,5,9,
+2026-02-03T09:37:37.421426,7418afe2-21da-426f-9fe4-2f33d647d92a,21,Uomo,Triennale,3,1,4,4,4,2,4,1,4,1,4,4,4,3,4,7,"Durante la risposta alla domande, nel citare le fonti, non inserirei il titolo completo della fonte in quanto potrebbe risultare fastidioso se il nome del file fosse lungo, piuttosto inserirei un numero che ci fa capire la fonte."
+2026-02-05T09:49:24.166298,c8f9d0be-2731-4c42-98a0-1542cb347232,23,Non binario,Magistrale,3,1,5,1,4,1,5,1,5,1,4,5,5,3,3,8,
+2026-02-05T09:49:37.843112,b6fa79fc-a979-4359-a9f9-1b66f3e9f767,23,Uomo,Magistrale,4,1,5,1,5,1,5,1,5,1,5,5,5,3,5,8,
+2026-02-05T10:17:12.362448,6d77531b-673c-4669-9e54-f7a6d173fa35,,Uomo,Triennale,5,1,4,2,4,1,4,1,4,2,5,5,5,5,5,8,Forse l'unico aspetto che migliorerei è quello di nascondere in qualche modo le funzionalità riservate agli sviluppatori del sistema.
+2026-02-05T10:18:10.776906,04d06c52-7f7b-4ed5-81ea-625d4ff665b2,21,Uomo,Triennale,4,1,5,1,5,1,5,1,5,1,5,5,5,4,5,10,
+2026-02-05T10:51:59.599832,dc9580b1-b767-4cbf-abc5-e79ab1e0fa01,21,Uomo,Triennale,3,1,5,1,5,1,5,1,4,1,5,5,5,4,5,8,
+2026-02-06T10:53:29.124256,868a1a69-f2c1-4bd6-94fd-57772884bff9,33,Uomo,Triennale,2,1,4,2,3,1,4,1,5,1,2,4,4,1,3,6,"Aggiungerei riferimenti puntuali alle risposte (capitolo, pagina) permettendo allo studente di approfondire.
+Ho notato qualche incongruenza legata al livello selezionato per la risposta."
+2026-02-06T11:08:45.166722,3ac7aae0-ff54-473f-bb9d-359d655784a3,21,Uomo,Triennale,5,1,5,2,5,1,5,1,4,2,5,5,5,5,5,9,
+2026-02-11T11:25:08.925829,4524e76c-5731-4cef-a2ae-7a3f132798cf,30,Uomo,Triennale,4,1,5,1,5,1,5,1,5,1,5,5,5,5,5,8,"Riportare in fondo alla risposta, oltre ai riferimenti dei documenti, le eventuali pagine da cui le informazioni sono state estratte"
+2026-02-11T11:25:16.458225,f79c3272-7c66-4379-af1f-9e61cf2cfa54,24,Uomo,Triennale,4,1,5,1,3,2,4,1,5,1,5,4,4,4,5,8,"Per rispondere alla prima domanda ci ha messo un poco di tempo, ma credo sia normale"
