@@ -20,7 +20,11 @@ echo Installing dependencies from requirements.txt...
 pip install -r requirements.txt
 
 echo ===========================================
-echo Setup complete! To run the app:
+echo Setup complete!
+echo.
+echo IMPORTANT: Run setup_db.bat next to build the knowledge base.
+echo.
+echo To run the app (after DB setup):
 echo streamlit run streamlit_frontend.py
 echo ===========================================
 pause

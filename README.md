@@ -61,6 +61,13 @@ Contains materials and results from the human evaluation (User Study).
 5.  **Configure Environment**:
     - Copy `.env.example` to `.env` (if available) or set your API keys (TogetherAI, Ngrok) in the environment variables.
 
+6.  **Build Knowledge Base**:
+    - **Windows**: Run `setup_db.bat` (this will create/update the FAISS index).
+    - **Linux/Mac**: Run:
+        ```bash
+        python -m study_buddy.vectorstore_pipeline.update_faiss_index
+        ```
+
 ---
 
 ## ▶️ Running the Application
