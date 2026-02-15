@@ -1,4 +1,4 @@
-# Univox: Intelligent Study Assistant
+# Intelligent Study Assistant
 
 This repository contains the source code, evaluation data, and user study results for **Univox**, an AI-powered study assistant designed to help university students with their coursework.
 
